@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,7 @@ class PermisData(BaseModel):
 class CINData(BaseModel):
     nom: str | None = None
     prenom: str | None = None
+    pere: str | None = None
     numero_cin: str | None = None
     date_naissance: str | None = None
     gouvernorat: str | None = None
@@ -47,8 +48,6 @@ class AssuranceData(BaseModel):
     raw_text: str = ""
 
 
-from typing import Union  # noqa: E402
-
 ParsedData = Union[PermisData, CINData, CarteGriseData, AssuranceData]
 
 
@@ -56,7 +55,7 @@ class OCRExtractPayload(BaseModel):
     doc_type: DocType
     confidence: float
     status: Status
-    data: dict
+    data: dict[str, Any]
     processing_time_ms: int
 
 

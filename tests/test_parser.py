@@ -209,6 +209,43 @@ def test_cin_arabic_no_labels_uses_word_order():
     assert out["gouvernorat"] == "SOUSSE"
 
 
+def test_cin_recto_header_misread_doubled_letter_skipped():
+    # Real-world failure (May 2026): PaddleOCR emitted "التعرريف"
+    # (extra ر) instead of "التعريف" for the header word. Exact-match
+    # stop-words missed it, so it leaked into `nom` and pushed the real
+    # name out of the candidate pool. Pattern-match on the root must
+    # still skip the misread.
+    raw = (
+        "الجمهورية التونسية بطاقة التعرريف الوطنية 14523154 "
+        "كركوب سهيلة 16 جويلية 2003 تونس"
+    )
+    out = parse_fields(raw, "cin")
+    assert out["nom"] == "كركوب"
+    assert out["prenom"] == "سهيلة"
+    assert out["numero_cin"] == "14523154"
+    assert out["date_naissance"] == "2003-07-16"
+    assert out["gouvernorat"] == "TUNIS"
+
+
+def test_cin_recto_header_words_skipped_in_fallback():
+    # Real-world failure: PaddleOCR captured the printed header
+    # "الجمهورية التونسية بطاقة التعريف الوطنية" but missed the
+    # field labels (اللقب / الاسم), so the word-order fallback
+    # was promoting header tokens into nom/prenom. The header
+    # must be filtered so the cardholder's actual names win.
+    raw = (
+        "الجمهورية التونسية بطاقة التعريف الوطنية 14523154 "
+        "كركوب سهيلة بن علي 16 جويلية 2003 تونس"
+    )
+    out = parse_fields(raw, "cin")
+    assert out["nom"] == "كركوب"
+    assert out["prenom"] == "سهيلة"
+    assert out["pere"] == "علي"
+    assert out["numero_cin"] == "14523154"
+    assert out["date_naissance"] == "2003-07-16"
+    assert out["gouvernorat"] == "TUNIS"
+
+
 def test_cin_mixed_french_arabic_keeps_french_for_governorate():
     raw = "12345678 اللقب بن علي الإسم محمد 16/09/1990 TUNIS"
     out = parse_fields(raw, "cin")

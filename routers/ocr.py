@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Annotated
@@ -8,7 +9,9 @@ from config import get_settings
 from errors import OCRError, OCRErrorCode
 from metrics import ocr_confidence, ocr_errors_total, ocr_field_present_total, ocr_latency_seconds
 from middleware.auth import require_internal_secret
-from ocr_engine import confidence_to_status, run_ocr
+from ocr_engine import confidence_to_status, run_ocr_async
+from rate_limit import limiter
+from schemas import OCRExtractPayload, OCRExtractResponse
 from utils.image_processor import preprocess_image
 from utils.parser import parse_fields
 
@@ -17,12 +20,13 @@ router = APIRouter(tags=["ocr"], dependencies=[Depends(require_internal_secret)]
 logger = logging.getLogger(__name__)
 
 
-@router.post("/ocr/extract")
+@router.post("/ocr/extract", response_model=OCRExtractResponse)
+@limiter.limit(f"{get_settings().RATE_LIMIT_PER_MINUTE}/minute")
 async def ocr_extract(
     request: Request,
     file: Annotated[UploadFile, File(description="Image file (jpg/png/webp)")],
     doc_type: Annotated[str, Form(description="permis | cin | carte_grise | assurance")],
-) -> dict:
+) -> OCRExtractResponse:
     settings = get_settings()
 
     if doc_type not in settings.SUPPORTED_DOC_TYPES:
@@ -58,7 +62,7 @@ async def ocr_extract(
     t_start = time.perf_counter()
 
     try:
-        img_array = preprocess_image(image_bytes)
+        img_array = await asyncio.to_thread(preprocess_image, image_bytes)
     except ValueError as exc:
         if str(exc) == "image_too_small":
             raise OCRError(
@@ -66,10 +70,28 @@ async def ocr_extract(
                 "Image is too small — minimum dimensions are 200x200 px",
                 {"min_dimension": 200},
             ) from exc
+        if str(exc) == "image_too_large":
+            raise OCRError(
+                OCRErrorCode.PAYLOAD_TOO_LARGE,
+                "Image exceeds maximum decoded size (decompression bomb protection)",
+                {"max_pixels": 30_000_000},
+            ) from exc
+        if str(exc) == "image_unreadable":
+            raise OCRError(
+                OCRErrorCode.VALIDATION_ERROR,
+                "Image is corrupted or not a supported image format",
+            ) from exc
         raise OCRError(OCRErrorCode.VALIDATION_ERROR, f"Image processing error: {exc}") from exc
 
     try:
-        raw_text, confidence, per_engine = run_ocr(img_array)
+        raw_text, confidence, per_engine = await run_ocr_async(img_array, doc_type=doc_type)
+    except TimeoutError as exc:
+        logger.warning("ocr_pipeline_timeout", extra={"error": str(exc)})
+        raise OCRError(
+            OCRErrorCode.ENGINE_TIMEOUT,
+            "OCR engine timed out",
+            {"error": str(exc)},
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("ocr_pipeline_crash")
         raise OCRError(
@@ -110,16 +132,15 @@ async def ocr_extract(
         },
     )
 
-    return {
-        "success": True,
-        "data": {
-            "doc_type": doc_type,
-            "confidence": confidence,
-            "status": status,
-            "data": parsed,
-            "processing_time_ms": processing_time_ms,
-        },
-    }
+    return OCRExtractResponse(
+        data=OCRExtractPayload(
+            doc_type=doc_type,
+            confidence=confidence,
+            status=status,
+            data=parsed,
+            processing_time_ms=processing_time_ms,
+        ),
+    )
 
 
 async def _read_with_cap(file: UploadFile, max_bytes: int) -> bytes:

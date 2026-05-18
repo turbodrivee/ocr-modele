@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+
+
+logger = logging.getLogger(__name__)
 
 
 class OCRErrorCode(str, Enum):
@@ -14,8 +18,10 @@ class OCRErrorCode(str, Enum):
     IMAGE_TOO_SMALL = "OCR_IMAGE_TOO_SMALL"
     PAYLOAD_TOO_LARGE = "OCR_PAYLOAD_TOO_LARGE"
     ENGINE_FAILURE = "OCR_ENGINE_FAILURE"
+    ENGINE_TIMEOUT = "OCR_ENGINE_TIMEOUT"
     RATE_LIMITED = "OCR_RATE_LIMITED"
     VALIDATION_ERROR = "OCR_VALIDATION_ERROR"
+    INTERNAL = "OCR_INTERNAL"
 
 
 _HTTP_STATUS_MAP: dict[OCRErrorCode, int] = {
@@ -25,8 +31,10 @@ _HTTP_STATUS_MAP: dict[OCRErrorCode, int] = {
     OCRErrorCode.IMAGE_TOO_SMALL: 400,
     OCRErrorCode.PAYLOAD_TOO_LARGE: 413,
     OCRErrorCode.ENGINE_FAILURE: 502,
+    OCRErrorCode.ENGINE_TIMEOUT: 504,
     OCRErrorCode.RATE_LIMITED: 429,
     OCRErrorCode.VALIDATION_ERROR: 400,
+    OCRErrorCode.INTERNAL: 500,
 }
 
 
@@ -77,10 +85,14 @@ async def ocr_error_handler(request: Request, exc: OCRError) -> JSONResponse:
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None)
     headers = {"X-Request-ID": request_id} if request_id else {}
+    logger.exception(
+        "unhandled_exception",
+        extra={"request_id": request_id, "path": request.url.path},
+    )
     return JSONResponse(
         status_code=500,
         content=envelope_error(
-            OCRErrorCode.ENGINE_FAILURE,
+            OCRErrorCode.INTERNAL,
             "Internal server error",
             {"request_id": request_id} if request_id else {},
         ),

@@ -16,15 +16,18 @@ _TUNISIAN_GOVERNORATES = {
 }
 
 # ── Arabic support (CIN parser) ────────────────────────────────────────────
-# Tunisian CIN cards print fields predominantly in Arabic. The four ranges
-# below cover Arabic base letters, Arabic Supplement, and presentation
-# forms A and B — anything PaddleOCR-AR will plausibly emit.
+# Tunisian CIN cards print fields predominantly in Arabic. Only Arabic
+# *letters* — punctuation (،  ؟  ؛), the tatweel U+0640 (calligraphic
+# stretch), Arabic-Indic digits, and other signs are deliberately excluded
+# so `_AR_WORD = _AR_LETTER{2,}` cannot match a run of punctuation as a
+# "word" and pollute the name-fallback heuristics.
 _AR_LETTER = (
-    "[؀-ٟ"   # Arabic block, up to but excluding the Indic digits at U+0660-U+0669
-    "٪-ۿ"    # Arabic block, resuming after the digits
+    "[ء-غ"   # Hamza..Ghain
+    "ف-ي"    # Fa..Ya (skips tatweel U+0640)
+    "ٱ-ۓ"    # Extended Arabic letters
     "ݐ-ݿ"    # Arabic Supplement
-    "ﭐ-﷿"    # Arabic Presentation Forms-A
-    "ﹰ-ﻼ]"   # Arabic Presentation Forms-B
+    "ﭐ-﷿"    # Presentation Forms-A
+    "ﹰ-ﻼ]"   # Presentation Forms-B
 )
 _AR_WORD = rf"{_AR_LETTER}{{2,}}"
 _AR_DIGIT = "[٠-٩]"
@@ -42,12 +45,36 @@ _AR_STOP_WORDS = {
     "اللقب", "اللّقب", "لقب",
     "الإسم", "الاسم", "اسم",
     "ولد", "ولدت", "في", "تاريخ", "الولادة", "الميلاد",
-    "الجنسية", "تونسية", "تونسي",
+    "الجنسية", "التونسية", "تونسية", "تونسي",
     # Lineage connectors — never a name on their own.
     "بن", "بنت",
     # Verso-side parent labels — these are field labels, not the cardholder's name.
     "الأم", "الام", "الأب",
 }
+
+# Recto header words — the printed title "الجمهورية التونسية بطاقة التعريف
+# الوطنية" appears on every Tunisian CIN. PaddleOCR misreads these in
+# many ways (التعرريف with doubled ر, التحريف, اللتعريف, بطاقه, الجمهوريه,
+# etc.), so exact-match stop-words can't keep up. Pattern-match on the
+# stable Arabic root of each header word instead — that catches every
+# realistic OCR variant without listing them. Note: bare "تونس" is the
+# governorate (handled separately) so we anchor on "تونسي" / "تونسيه".
+_AR_HEADER_PATTERNS = (
+    re.compile(r"جمهور"),       # ال?جمهوري(ة|ه)?
+    re.compile(r"تونسي"),       # ال?تونسي(ة|ه)? — but NOT bare تونس (city)
+    re.compile(r"بطاق"),        # بطاق(ة|ه|ا)
+    re.compile(r"ت[حعخ]ر+ي?ف"),  # التعريف / التحريف / التعرريف / اللتعريف / للتعريف
+    re.compile(r"وطني"),        # ال?وطني(ة|ه)?
+)
+
+
+def _is_header_word(word: str) -> bool:
+    """True if `word` is (or is a noisy OCR misread of) a CIN header word.
+
+    Used by the word-order fallback to skip the printed title before
+    picking the cardholder's nom/prenom.
+    """
+    return any(p.search(word) for p in _AR_HEADER_PATTERNS)
 
 # Arabic ⇒ French governorate map. Variants with/without leading ال
 # definite article are both common on OCR output. Ordered longest-first
@@ -182,9 +209,12 @@ def _to_iso_date(d: str, m: str, y: str) -> str | None:
         cutoff = (date.today().year - 2000) + 30
         year = 2000 + year if year <= cutoff else 1900 + year
 
-    if not (1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100):
+    if not (1900 <= year <= 2100):
         return None
-    return f"{year:04d}-{month:02d}-{day:02d}"
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
 
 
 def _find_date_arabic(text: str) -> str | None:
@@ -293,9 +323,11 @@ def _extract_arabic_name(text: str, label_pattern: str) -> str | None:
         if tail and tail.group(1) not in _AR_STOP_WORDS:
             return f"{first} {tail.group(1)}"
         return None
-    if first in _AR_STOP_WORDS:
+    if first in _AR_STOP_WORDS or _is_header_word(first):
         # Label is present but immediately followed by another label/keyword
-        # (e.g. "ولقب الأم" on the verso) — no real name to extract here.
+        # (e.g. "ولقب الأم" on the verso) or by a header-word OCR misread
+        # (e.g. "اللقب التعرريف" where PaddleOCR jumbled the lines) — no
+        # real name to extract here.
         return None
     return first
 
@@ -304,88 +336,110 @@ def _resolve_pere_and_fix_prenom(
     text: str,
     nom: str | None,
     prenom: str | None,
-) -> tuple[str | None, str | None]:
-    """Use the بن/بنت connector to extract father's name and (if needed)
-    correct a prenom that was actually the father's first name.
+) -> tuple[str | None, str | None, str | None]:
+    """Anchor on the بن/بنت lineage marker for nom/prenom/pere positioning.
 
-    Canonical layout: `… اللقب <nom> الاسم <prenom> بن <pere> …`
-        → label-anchored prenom IS the cardholder's given name; pere is
-          the token after بن.
+    Tunisian CIN layout: `[FAMILY] [GIVEN] بن [FATHER] …`
+        → prenom = the word immediately before بن
+        → nom    = the word(s) before that
+        → pere   = the word immediately after بن
 
-    Scrambled OCR layout: `… اللقب <nom> <given_name> الاسم <pere> بن … …`
-        → label-anchored prenom is the father's first name (token before بن).
-          The given name was concatenated by PaddleOCR after `nom`; recover
-          it as the first non-stop-word token between `nom` and `الاسم`.
+    A scrambled-OCR fallback handles the case where PaddleOCR concatenated
+    detection lines out of canonical order, leaving the cardholder's real
+    given name wedged between `nom` and a label-anchored prenom that is
+    actually the father's first name.
 
-    Returns (prenom, pere). Either may be None.
+    If no real lineage marker is present (or the only marker is part of a
+    compound surname like "بن علي"), the caller's nom/prenom pass through
+    unchanged and pere is None.
     """
-    if not prenom:
-        return prenom, None
-
     tokens = _find_arabic_words_in_order(text)
     if not tokens:
-        return prenom, None
+        return nom, prenom, None
 
-    # If the nom is a compound starting with بن (e.g. "بن علي"), the
-    # marker inside the surname must NOT be treated as a lineage connector.
+    gov_tokens = {tok for k in _GOVERNORATES_AR_TO_FR for tok in k.split()}
+    # Stops that cannot be names. Keep lineage markers OUT so they remain
+    # detectable as anchors; filter labels, parent-field labels, governorate
+    # tokens, and Arabic month names.
+    name_stops = (
+        (_AR_STOP_WORDS - set(_LINEAGE_MARKERS))
+        | gov_tokens
+        | set(_AR_MONTHS.keys())
+    )
+
+    def _keep(tok: str) -> bool:
+        return tok not in name_stops and not _is_header_word(tok)
+
+    marker_positions = [i for i, t in enumerate(tokens) if t in _LINEAGE_MARKERS]
+    if not marker_positions:
+        return nom, prenom, None
+
+    # Compound-surname edge case: the first marker may be the بن inside a
+    # "بن X" family name rather than a lineage connector. Detected either
+    # by an existing compound `nom` starting with بن, or by the raw text
+    # opening with بن (no name token in front of it). Shift to the next
+    # marker — or, if there isn't one, return early with pere=None.
+    marker_idx = marker_positions[0]
     nom_parts = nom.split() if nom else []
-    surname_marker_idx = None
+    surname_owns_first_marker = False
     if len(nom_parts) >= 2 and nom_parts[0] in _LINEAGE_MARKERS:
         for i in range(len(tokens) - 1):
             if tokens[i] == nom_parts[0] and tokens[i + 1] == nom_parts[1]:
-                surname_marker_idx = i
+                surname_owns_first_marker = (i == marker_positions[0])
                 break
+    elif not [t for t in tokens[:marker_idx] if _keep(t)]:
+        surname_owns_first_marker = True
 
-    # Find the first lineage marker that isn't part of the surname.
-    marker_idx = next(
-        (
-            i for i, t in enumerate(tokens)
-            if t in _LINEAGE_MARKERS and i != surname_marker_idx
-        ),
-        -1,
+    if surname_owns_first_marker:
+        if len(marker_positions) < 2:
+            return nom, prenom, None
+        marker_idx = marker_positions[1]
+
+    words_before_ben = [t for t in tokens[:marker_idx] if _keep(t)]
+    word_after_ben = next(
+        (t for t in tokens[marker_idx + 1:] if _keep(t)),
+        None,
     )
-    if marker_idx == -1:
-        return prenom, None
 
-    before = tokens[marker_idx - 1] if marker_idx - 1 >= 0 else None
-    after = tokens[marker_idx + 1] if marker_idx + 1 < len(tokens) else None
-
-    # Disambiguator: is there a non-stop-word Arabic token wedged between
-    # nom and the label-anchored prenom? If yes → OCR scrambled the lines
-    # (the wedged token is the real given name, and the label-anchored
-    # prenom is actually the father's first name). If no → canonical layout.
-    wedged: str | None = None
-    if nom_parts and prenom in tokens:
+    # Scrambled-OCR fallback: if a label-anchored prenom sits as the token
+    # right before بن AND there's another non-stop-word wedged between the
+    # label-anchored `nom` and that prenom, the OCR concatenated lines out
+    # of order. The wedged token is the real given name; the label-anchored
+    # prenom is actually the father's first name.
+    if prenom and nom_parts and words_before_ben and words_before_ben[-1] == prenom:
         last_nom_word = nom_parts[-1]
-        nom_idx = next(
-            (i for i in range(len(tokens) - 1, -1, -1) if tokens[i] == last_nom_word),
+        nom_pos = next(
+            (i for i in range(marker_idx - 1, -1, -1) if tokens[i] == last_nom_word),
             -1,
         )
-        prenom_idx = tokens.index(prenom)
-        if 0 <= nom_idx < prenom_idx:
-            gov_tokens = {tok for k in _GOVERNORATES_AR_TO_FR for tok in k.split()}
-            stops = _AR_STOP_WORDS | gov_tokens | set(_AR_MONTHS.keys())
-            wedged_candidates = [
-                t for t in tokens[nom_idx + 1:prenom_idx]
-                if t not in stops and t not in nom_parts
-            ]
-            if wedged_candidates:
-                wedged = wedged_candidates[0]
+        prenom_pos = next(
+            (i for i in range(nom_pos + 1, marker_idx) if tokens[i] == prenom),
+            -1,
+        )
+        if 0 <= nom_pos < prenom_pos:
+            wedged = next(
+                (
+                    t for t in tokens[nom_pos + 1:prenom_pos]
+                    if t not in name_stops and t not in nom_parts
+                ),
+                None,
+            )
+            if wedged is not None:
+                return nom, wedged, prenom
 
-    if wedged is not None:
-        # Scrambled OCR: the token wedged after `nom` is the real prenom,
-        # and the label-anchored prenom is the father's first name.
-        return wedged, prenom
+    # Canonical / positional layout.
+    if len(words_before_ben) >= 2:
+        prenom_out = words_before_ben[-1]
+        nom_out = " ".join(words_before_ben[:-1])
+    elif len(words_before_ben) == 1:
+        # Single word — assume it's the family name, prenom missing.
+        nom_out = words_before_ben[0]
+        prenom_out = None
+    else:
+        nom_out = None
+        prenom_out = None
 
-    # Canonical layout: keep the label-anchored prenom; pere is the token
-    # immediately after the marker.
-    if before == prenom:
-        return prenom, after
-
-    # Edge: marker present but neither layout matches — best-effort pere.
-    if before is None or before in _AR_STOP_WORDS:
-        return prenom, after if after and after not in _AR_STOP_WORDS else None
-    return prenom, before
+    return nom_out, prenom_out, word_after_ben or None
 
 
 def _find_arabic_words_in_order(text: str) -> list[str]:
@@ -649,21 +703,35 @@ def _parse_cin(text: str) -> dict[str, Any]:
         gov_tokens = {tok for k in gov_words for tok in k.split()}
         stops = _AR_STOP_WORDS | gov_tokens | taken_words
 
-        candidates = [w for w in _find_arabic_words_in_order(text) if w not in stops]
+        candidates = [
+            w for w in _find_arabic_words_in_order(text)
+            if w not in stops and not _is_header_word(w)
+        ]
         if not nom and candidates:
             nom = candidates.pop(0)
         if not prenom and candidates:
             prenom = candidates.pop(0)
 
     if not (nom and prenom) and not is_verso:
-        legacy = _find_uppercase_names(text)
-        if not nom and legacy:
-            nom = legacy[0]
-        if not prenom and len(legacy) > 1:
-            prenom = legacy[1]
+        # `_find_uppercase_names` returns greedy runs like "OMRI SALAH SFAX VILLE".
+        # We must split them into tokens and drop governorate tokens before
+        # assigning nom/prenom, otherwise the cardholder's name absorbs the
+        # gouvernorat that lives in the same uppercase strip.
+        _gov_tokens = {tok for g in _TUNISIAN_GOVERNORATES for tok in g.split()}
+        _city_modifiers = {"VILLE", "CITY", "CENTRE"}  # noise frequently glued to gov names
+        legacy_tokens: list[str] = []
+        for match in _find_uppercase_names(text):
+            for tok in match.split():
+                if tok in _gov_tokens or tok in _city_modifiers:
+                    continue
+                legacy_tokens.append(tok)
+        if not nom and legacy_tokens:
+            nom = legacy_tokens[0]
+        if not prenom and len(legacy_tokens) > 1:
+            prenom = legacy_tokens[1]
 
-    # ── Lineage marker (بن / بنت): recover prenom/pere from chain ────────
-    prenom, pere = _resolve_pere_and_fix_prenom(text, nom, prenom)
+    # ── Lineage marker (بن / بنت): positional recovery of nom/prenom/pere ─
+    nom, prenom, pere = _resolve_pere_and_fix_prenom(text, nom, prenom)
 
     # ── Date: Arabic strict → Arabic loose → Western numeric ────────────
     # Skip on verso scans (the only date there is the card-issue date).
@@ -676,7 +744,10 @@ def _parse_cin(text: str) -> dict[str, Any]:
             m = re.search(_DATE_PATTERN, text)
             if m:
                 day, month, year = m.group(1).replace("-", "/").split("/")
-                date_naissance = _to_iso_date(day, month, year) or m.group(1)
+                # Only keep the date if it normalises to a valid ISO string.
+                # Returning the raw match (e.g. "31/04/2025") would break the
+                # contract "all CIN dates are ISO YYYY-MM-DD or None".
+                date_naissance = _to_iso_date(day, month, year)
 
     # ── Governorate: AR map → Latin set ─────────────────────────────────
     gouvernorat = _match_arabic_governorate(text)
@@ -750,8 +821,10 @@ def _parse_assurance(text: str) -> dict[str, Any]:
     # "Validité Du/D …" → date de début
     m = re.search(rf"[Vv]alidit[eé]\s+[Dd][Uu]?\s*({_DATE_LOOSE})", text)
     if not m:
-        # OCR peut coller "D" directement: "D25/10/2025"
-        m = re.search(rf"(?<=[Dd])({_DATE_LOOSE})", text)
+        # OCR may glue "Du" / "D" to the date with no space: "Du25/10/2025"
+        # or "D25/10/2025". Anchor on a word boundary BEFORE the D/d so we
+        # don't false-match on "DAR25/10/2025", "ID25/10/2025", etc.
+        m = re.search(rf"\b[Dd]u?\s*({_DATE_LOOSE})", text)
     if m:
         date_debut = m.group(1)
 
@@ -768,9 +841,11 @@ def _parse_assurance(text: str) -> dict[str, Any]:
         if m:
             date_debut = m.group(1)
 
-    # Fallback: toutes les dates (sans \b pour attraper "D25/10/2025")
+    # Fallback: all dates in text — but reject any date GLUED to a letter
+    # (e.g. "DAR25/10/2025", "ID25/10/2025", "BAD25/10/2025"). Glued
+    # "Du"/"D" prefixes have already been claimed by the labelled pass above.
     if not date_debut or not date_fin:
-        all_dates = re.findall(_DATE_LOOSE, text)
+        all_dates = re.findall(rf"(?<![A-Za-z]){_DATE_LOOSE}", text)
         if not date_debut and all_dates:
             date_debut = all_dates[0]
         if not date_fin and len(all_dates) > 1:

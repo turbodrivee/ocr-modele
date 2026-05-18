@@ -2,15 +2,15 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 
 from config import get_settings
 from errors import OCRError, OCRErrorCode, envelope_error, ocr_error_handler, unhandled_exception_handler
 from middleware.logging import configure_logging
 from middleware.request_id import RequestIDMiddleware
-from ocr_engine import set_engines
+from ocr_engine import set_engines, shutdown_engines
+from rate_limit import limiter
 from routers import health, metrics as metrics_router, ocr
 
 
@@ -18,13 +18,12 @@ settings = get_settings()
 configure_logging(settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[f"{settings.RATE_LIMIT_PER_MINUTE}/minute"])
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("ocr_service_starting", extra={"env": settings.ENV})
     from paddleocr import PaddleOCR
+    import numpy as np
 
     use_orient = settings.OCR_USE_ORIENTATION_DETECTION
     fr = PaddleOCR(
@@ -43,6 +42,20 @@ async def lifespan(app: FastAPI):
         use_doc_orientation_classify=use_orient,
         use_doc_unwarping=False,
     )
+
+    # Warmup: PaddleOCR's first predict() does JIT compilation + lazy weight
+    # loading and can take 30-60 s on CPU. Without this warmup, the first
+    # real user upload eats that cost (and often hits the proxy timeout).
+    # Pay it at startup instead, on a 320×320 white image.
+    logger.info("ocr_warmup_start")
+    dummy = np.full((320, 320, 3), 255, dtype=np.uint8)
+    for label, engine in (("fr", fr), ("ar", ar)):
+        try:
+            engine.predict(dummy)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ocr_warmup_failed", extra={"engine": label, "error": str(exc)})
+    logger.info("ocr_warmup_done")
+
     set_engines(fr, ar)
     logger.info(
         "ocr_service_ready",
@@ -50,11 +63,13 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("ocr_service_stopping")
+    shutdown_engines()
 
 
 app = FastAPI(title="OCR Document Service", version="1.0.0", lifespan=lifespan)
 
 app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
 

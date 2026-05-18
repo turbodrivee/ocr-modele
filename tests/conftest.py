@@ -67,7 +67,14 @@ def install_stub_engines(monkeypatch: pytest.MonkeyPatch) -> Iterator[callable]:
 
     def _install(doc_type: str = "permis") -> None:
         texts, scores = _stub_for(doc_type)
-        ocr_engine.set_engines(StubEngine(texts, scores), StubEngine([], []))
+        # CIN runs only the Arabic engine in production (see
+        # ocr_engine._AR_ONLY_DOC_TYPES), so its stub data must live on the
+        # AR slot. Other doc types run both engines in parallel; we route
+        # the canned data through the FR slot and leave AR empty.
+        if doc_type == "cin":
+            ocr_engine.set_engines(StubEngine([], []), StubEngine(texts, scores))
+        else:
+            ocr_engine.set_engines(StubEngine(texts, scores), StubEngine([], []))
 
     yield _install
     ocr_engine.set_engines(None, None)
