@@ -65,7 +65,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # - timeout=120: an OCR request can legitimately take 10-45 s.
 # Override via `docker run -e WEB_CONCURRENCY=4` if you have more CPUs.
 ENV WEB_CONCURRENCY=2 \
-    GUNICORN_TIMEOUT=120
+    GUNICORN_TIMEOUT=120 \
+    PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false
 
 CMD gunicorn main:app \
     --workers ${WEB_CONCURRENCY} \
