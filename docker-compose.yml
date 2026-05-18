@@ -1,0 +1,47 @@
+# Single-service compose for local dev and small prod deployments.
+# Reads env vars from `.env` automatically (override per env).
+# Usage:
+#   docker compose up -d       # build + start in background
+#   docker compose logs -f     # tail logs
+#   docker compose down        # stop + remove
+
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ocr-service:latest
+    container_name: ocr-service
+    restart: unless-stopped
+    ports:
+      - "${OCR_HOST_PORT:-8000}:8000"
+    environment:
+      ENV: ${ENV:-dev}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?INTERNAL_SECRET is required}
+      INTERNAL_SECRET_PREVIOUS: ${INTERNAL_SECRET_PREVIOUS:-}
+      LEGACY_API_KEY: ${LEGACY_API_KEY:-}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10485760}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      OCR_USE_ORIENTATION_DETECTION: ${OCR_USE_ORIENTATION_DETECTION:-true}
+      # Gunicorn tuning — override per host.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Per-container resource caps (loose defaults — tune for your host).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 1G
+    # Pretty container labels for `docker ps` / observability.
+    labels:
+      service: ocr
+      component: paddleocr-fastapi

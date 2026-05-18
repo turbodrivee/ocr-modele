@@ -9,22 +9,56 @@ public internet, no CORS configured by design.
 
 ## Setup
 
+### Option A — Docker (recommended)
+
+```bash
+cd ocr-service
+cp .env.example .env
+# Edit .env and set INTERNAL_SECRET to a strong random value
+
+docker compose up -d --build   # ~5-10 min first time (bakes the 500 MB models in)
+docker compose logs -f         # wait for "ocr_service_ready"
+curl http://localhost:8000/v1/health/ready
+```
+
+The image is **multi-stage** (builder + runtime), serves with **gunicorn
++ uvicorn workers** (2 workers by default, tune via `WEB_CONCURRENCY`),
+runs as **non-root**, and ships with a **HEALTHCHECK** that hits
+`/v1/health/ready`. Models are baked at build time so cold starts are instant.
+
+### Option B — Local Python (for development)
+
 ```bash
 cd ocr-service
 
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate                # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt      # includes pytest, httpx
 
 cp .env.example .env
-# Edit .env and set INTERNAL_SECRET to a strong random value
+# Edit .env and set INTERNAL_SECRET
 
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-> The first run downloads PaddleOCR models (~500 MB). Subsequent starts
-> reuse the cached models. The Docker image bakes them in at build time
-> via `prefetch_models.py`.
+> First local run downloads PaddleOCR models (~500 MB) into `~/.paddleocr/`.
+> Subsequent starts reuse the cache.
+
+### Make targets
+
+| Target          | What it does                                       |
+|-----------------|----------------------------------------------------|
+| `make install`  | Create `.venv` and install dev deps                |
+| `make dev`      | Run uvicorn locally with hot-reload                |
+| `make test`     | Run the full pytest suite (112 tests)              |
+| `make build`    | `docker compose build`                             |
+| `make up`       | `docker compose up -d`                             |
+| `make down`     | `docker compose down`                              |
+| `make logs`     | Tail container logs                                |
+| `make health`   | Curl the readiness endpoint                        |
+| `make smoke`    | End-to-end OCR test (needs `sample.jpg` + env)     |
+
+Run `make help` to list everything.
 
 ## Endpoints
 
