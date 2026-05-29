@@ -118,7 +118,10 @@ def _run_one(
         return label, [], [], 0.0
 
 
-_AR_ONLY_DOC_TYPES = frozenset({"cin"})
+# CIN was AR-only to halve latency, but the Arabic engine misreads
+# Western-digit dates (DD/MM/YYYY) printed on Tunisian CIN cards.
+# Running the French engine alongside lets it read those date fields.
+_AR_ONLY_DOC_TYPES: frozenset[str] = frozenset()
 
 
 def run_ocr(

@@ -27,6 +27,7 @@ class CINData(BaseModel):
     pere: str | None = None
     numero_cin: str | None = None
     date_naissance: str | None = None
+    date_delivrance: str | None = None
     gouvernorat: str | None = None
     language_detected: Literal["ar", "fr", "mixed"] = "fr"
     raw_text: str = ""

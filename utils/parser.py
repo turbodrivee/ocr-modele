@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 _DATE_PATTERN = r"\b(\d{2}[\/\-]\d{2}[\/\-]\d{4})\b"
@@ -49,7 +52,7 @@ _AR_STOP_WORDS = {
     # Lineage connectors — never a name on their own.
     "بن", "بنت",
     # Verso-side parent labels — these are field labels, not the cardholder's name.
-    "الأم", "الام", "الأب",
+    "الأم", "الام", "الأب", "الاب",
 }
 
 # Recto header words — the printed title "الجمهورية التونسية بطاقة التعريف
@@ -124,20 +127,37 @@ _AR_MONTHS = {
 }
 
 _DATE_AR_LONG = rf"(\d{{1,2}})\s+({'|'.join(_AR_MONTHS)})\s+(\d{{4}})"
-_DATE_AR_DIGITS = rf"({_AR_DIGIT}{{1,4}})[\/\-]({_AR_DIGIT}{{1,2}})[\/\-]({_AR_DIGIT}{{2,4}})"
-_DATE_NUMERIC_FULL = r"(\d{1,4})[\/\-](\d{1,2})[\/\-](\d{2,4})"
+_DATE_AR_DIGITS = rf"({_AR_DIGIT}{{1,4}})[\/\-\.]({_AR_DIGIT}{{1,2}})[\/\-\.]({_AR_DIGIT}{{2,4}})"
+_DATE_NUMERIC_FULL = r"(\d{1,4})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})"
 
 # Permis date-label markers. Order = priority within each tuple.
 # Latin (EU field numbers + French phrases) → Arabic.
+# CIN issue-date labels. Tunisian CIN recto prints "صادرة في" or "تاريخ الإصدار"
+# near the issue date; verso repeats a standalone Western date at the bottom.
+_CIN_DELIVRANCE_LABELS = (
+    r"صادرة\s+ب?تونس\s+في\s*",   # "صادرة بتونس في …" — most common recto form
+    r"ب?تونس\s+في\s*",            # "بتونس في …" or "تونس في …"
+    r"[صس]ادرة?\s+في\s*:?\s*",    # OCR: صادرة / سادرة / صادر
+    r"ت?رض\s+في\s*:?\s*",         # OCR: "ترض في" (misread of صادرة في)
+    r"ت?ر[شs]?\s+ف?ي\s*:?\s*",    # OCR: "ترش في" / "ترش فجو" on verso
+    r"صادرة?\s+في\s*:?\s*",
+    r"تاريخ\s+الإصدار\s*:?\s*",
+    r"تاريخ\s+الاصدار\s*:?\s*",
+    r"تاريخ\s+التسليم\s*:?\s*",
+    r"D[eé]livr[eé]e?\s+le\s*:?\s*",
+    r"Date\s+de\s+d[eé]livrance\s*:?\s*",
+)
+
 _PERMIS_NAISSANCE_LABELS = (
     r"\b5\.\s*",
-    r"N[eé]\(?e\)?\s+le\s*:?\s*",
+    r"N[eé](?:e)?\s+le\s*:?\s*",
     r"Date\s+de\s+naissance\s*:?\s*",
     r"تاريخ\s+الولادة\s*:?\s*",
     r"تاريخ\s+الميلاد\s*:?\s*",
 )
 _PERMIS_DELIVRANCE_LABELS = (
     r"\b4\s*a\.\s*",
+    r"\b2\.\s*",  # Tunisian permis: field 2 = date de délivrance (often beside field 1.)
     r"Date\s+de\s+d[eé]livrance\s*:?\s*",
     r"D[eé]livr[eé]e?\s+le\s*:?\s*",
     r"تاريخ\s+التسليم\s*:?\s*",
@@ -478,44 +498,85 @@ def _iso_to_date(iso: str) -> date:
 
 
 def _find_labeled_date(text: str, label_patterns: tuple[str, ...]) -> str | None:
-    """First ISO date that appears within ~60 chars after any of the labels.
+    """First ISO date within ~200 chars before OR after any of the labels.
 
-    Labels are tried in declared priority order. For each label match the
-    forward window is scanned for, in turn: Western-digit DD-MM-YYYY,
-    Arabic-Indic numeric date, then `<day> <arabic-month> <year>`. The
-    first hit wins.
+    Labels are tried in declared priority order. For each label match we
+    search forward then backward (PaddleOCR RTL concatenation can put the
+    date before the label in the joined string). Patterns tried: Western
+    numeric, Arabic-Indic numeric, day+Arabic-month.
     """
+    def _scan_window(window: str) -> str | None:
+        m = re.search(_DATE_NUMERIC_FULL, window)
+        if m:
+            iso = _to_iso_date(m.group(1), m.group(2), m.group(3))
+            if iso:
+                return iso
+        m = re.search(_DATE_AR_DIGITS, window)
+        if m:
+            iso = _to_iso_date(m.group(1), m.group(2), m.group(3))
+            if iso:
+                return iso
+        m = re.search(_DATE_AR_LONG, window)
+        if m:
+            iso = _to_iso_date(m.group(1), str(_AR_MONTHS[m.group(2)]), m.group(3))
+            if iso:
+                return iso
+        return None
+
     for label_re in label_patterns:
         for label_match in re.finditer(label_re, text, re.IGNORECASE):
-            window = text[label_match.end(): label_match.end() + 60]
-
-            m = re.search(_DATE_NUMERIC_FULL, window)
-            if m:
-                iso = _to_iso_date(m.group(1), m.group(2), m.group(3))
-                if iso:
-                    return iso
-
-            m = re.search(_DATE_AR_DIGITS, window)
-            if m:
-                iso = _to_iso_date(m.group(1), m.group(2), m.group(3))
-                if iso:
-                    return iso
-
-            m = re.search(_DATE_AR_LONG, window)
-            if m:
-                iso = _to_iso_date(
-                    m.group(1), str(_AR_MONTHS[m.group(2)]), m.group(3)
-                )
-                if iso:
-                    return iso
+            # Forward window (date printed after the label)
+            forward = text[label_match.end(): label_match.end() + 200]
+            result = _scan_window(forward)
+            if result:
+                return result
+            # Backward window (RTL: date may appear before the label in joined text)
+            backward = text[max(0, label_match.start() - 200): label_match.start()]
+            result = _scan_window(backward)
+            if result:
+                return result
     return None
+
+
+def _collect_scattered_iso_dates(text: str) -> list[str]:
+    """Rebuild DD/MM/YYYY when OCR splits year and day/month (common on CIN verso).
+
+    Real PaddleOCR output often looks like ``2024 … 20878141 06 04`` with no
+    slashes — the issue date is still present but ``_DATE_NUMERIC_FULL`` misses it.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(iso: str | None) -> None:
+        if iso and iso not in seen:
+            seen.add(iso)
+            found.append(iso)
+
+    for year_m in re.finditer(r"\b(19\d{2}|20\d{2})\b", text):
+        year = year_m.group(1)
+        start = max(0, year_m.start() - 120)
+        end = min(len(text), year_m.end() + 120)
+        window = text[start:end]
+
+        for dm in re.finditer(r"(?<!\d)(\d{1,2})\s*[/\-.]\s*(\d{1,2})(?!\d)", window):
+            d, mo = int(dm.group(1)), int(dm.group(2))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                _add(_to_iso_date(dm.group(1), dm.group(2), year))
+
+        for dm in re.finditer(r"(?<!\d)(\d{1,2})\s+(\d{1,2})(?!\d)", window):
+            d, mo = int(dm.group(1)), int(dm.group(2))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                _add(_to_iso_date(dm.group(1), dm.group(2), year))
+
+    return found
 
 
 def _collect_all_iso_dates(text: str) -> list[str]:
     """Every recognizable date in text, normalised to ISO, deduped.
 
-    Latin numeric, Arabic-Indic numeric, and day-+-Arabic-month forms are
-    all considered. Order of first appearance is preserved.
+    Latin numeric, Arabic-Indic numeric, day-+-Arabic-month forms, and
+  scattered year/day/month fragments are all considered. Order of first
+    appearance is preserved.
     """
     found: list[str] = []
     seen: set[str] = set()
@@ -531,7 +592,181 @@ def _collect_all_iso_dates(text: str) -> list[str]:
         _add(_to_iso_date(m.group(1), m.group(2), m.group(3)))
     for m in re.finditer(_DATE_AR_LONG, text):
         _add(_to_iso_date(m.group(1), str(_AR_MONTHS[m.group(2)]), m.group(3)))
+    for iso in _collect_scattered_iso_dates(text):
+        _add(iso)
     return found
+
+
+def _find_arabic_month_year_date(text: str, *, prefer_most_recent: bool = False) -> str | None:
+    """Resolve `<month> <year>` or `<year> <month>` when the day is missing or scattered.
+
+    Common on CIN verso OCR output (e.g. "2024 جوان" or "جوان 2024").
+    """
+    months_pattern = "|".join(sorted(_AR_MONTHS.keys(), key=len, reverse=True))
+    candidates: list[tuple[date, str]] = []
+    for m in re.finditer(months_pattern, text):
+        month_num = _AR_MONTHS[m.group(0)]
+        window = text[max(0, m.start() - 30): min(len(text), m.end() + 30)]
+        year_m = re.search(r"\b(19\d{2}|20\d{2})\b", window)
+        if not year_m:
+            continue
+        year = year_m.group(1)
+        day = "01"
+        for d_match in re.finditer(r"\b(\d{1,2})\b", window):
+            if d_match.group(1) == year:
+                continue
+            n = int(d_match.group(1))
+            if 1 <= n <= 31:
+                day = d_match.group(1)
+                break
+        iso = _to_iso_date(day, str(month_num), year)
+        if iso:
+            candidates.append((_iso_to_date(iso), iso))
+    if not candidates:
+        return None
+    if prefer_most_recent:
+        return max(candidates, key=lambda t: t[0])[1]
+    return min(candidates, key=lambda t: t[0])[1]
+
+
+# Standalone category token (B, C4) — not the start of a word (BENALI, Délivré).
+_PERMIS_CATEGORY_RE = re.compile(
+    r"(?<![A-Za-z])([ABCDE])(?:\d{1,2})?(?=\s|$|[\.\/\-,\d])"
+)
+
+
+_PERMIS_CATEGORY_GRID_RE = re.compile(
+    r"(?<![A-Za-z])([ABCDE])(?:\d{1,2})?\s+"
+    r"(?:\d{1,2}[\/\-\.]\d{1,2}(?:[\/\-\.]\d{2,4})?|\d{1,2}\s+\d{1,2}(?:\s+\d{2,4})?)",
+    re.IGNORECASE,
+)
+
+
+def _count_permis_category_grid_lines(text: str) -> int:
+    return len(_PERMIS_CATEGORY_GRID_RE.findall(text))
+
+
+def _is_permis_verso(text: str) -> bool:
+    """Back of Tunisian/EU license: category grid and/or field 10 (échéance)."""
+    grid_lines = _count_permis_category_grid_lines(text)
+    if grid_lines >= 2:
+        return True
+    if grid_lines >= 1 and re.search(
+        r"\b10\.|"
+        r"[ée]ch[ée]ance|"
+        r"delivrance\s+par\s+cat|"
+        r"d[eé]livrance\s+par\s+cat",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\b10\.\s*\d", text) and not re.search(r"\b4a\.\s*\d", text):
+        return True
+    # Header text alone must not block verso when the category grid is present.
+    has_strong_front = bool(re.search(r"\b1\.\s*\d", text) and re.search(r"\b3\.\s+[A-Z]", text))
+    has_back_header = bool(
+        re.search(
+            r"Cat[eé]g[oó]r|delivrance\s+par\s+cat|d[eé]livrance\s+par\s+cat",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return has_back_header and not has_strong_front
+
+
+def _find_permis_category_grid(text: str) -> list[str]:
+    """Categories that have a per-category date on the verso (not template headers)."""
+    return sorted({m.group(1).upper() for m in _PERMIS_CATEGORY_GRID_RE.finditer(text)})
+
+
+def _find_permis_categories(text: str, *, is_verso: bool) -> list[str]:
+    """Extract A–E categories without picking letters from surnames or labels."""
+    if is_verso:
+        return _find_permis_category_grid(text)
+
+    found: set[str] = set()
+    # EU field 8 on recto — "8. B" or "8. A B"
+    m = re.search(r"\b8\.\s*([^\n]{1,40})", text)
+    if m:
+        for letter in _PERMIS_CATEGORY_RE.findall(m.group(1)):
+            found.add(letter)
+    return sorted(found)
+
+
+def _dates_on_permis_category_grid(text: str) -> set[str]:
+    """ISO dates printed next to a category letter (per-category issue), not global expiry."""
+    grid_dates: set[str] = set()
+    for m in _PERMIS_CATEGORY_GRID_RE.finditer(text):
+        tail = text[m.end(): m.end() + 40]
+        for dm in re.finditer(_DATE_NUMERIC_FULL, tail):
+            iso = _to_iso_date(dm.group(1), dm.group(2), dm.group(3))
+            if iso:
+                grid_dates.add(iso)
+    return grid_dates
+
+
+def _find_permis_verso_expiration(text: str) -> str | None:
+    """Global license expiry (field 10), not per-category delivery dates on the grid."""
+    date_expiration = _find_labeled_date(text, _PERMIS_EXPIRATION_LABELS)
+    if date_expiration:
+        return date_expiration
+
+    grid_dates = _dates_on_permis_category_grid(text)
+    today = date.today()
+    candidates = [
+        d
+        for d in _collect_all_iso_dates(text)
+        if d not in grid_dates and _iso_to_date(d) > today
+    ]
+    if candidates:
+        return max(candidates, key=_iso_to_date)
+
+    # Last resort: latest date on the card that is not a grid line (may still be past).
+    remaining = [d for d in _collect_all_iso_dates(text) if d not in grid_dates]
+    if remaining:
+        return max(remaining, key=_iso_to_date)
+    return None
+
+
+def _find_permis_numero(text: str) -> str | None:
+    """Tunisian permis number (EU field 1.), not the holder's 8-digit CIN.
+
+    PaddleOCR often emits the CIN before field ``1.``; a naive ``\\d{8}`` scan
+    therefore returns the wrong identifier.
+    """
+    # Priority 1 — EU field 1. (e.g. "1. 23/ 238943" → 23238943)
+    m = re.search(r"(?:^|\s)1\.\s*(\d[\d\s\/]+\d)", text)
+    if m:
+        candidate = re.sub(r"[\s\/]", "", m.group(1))
+        if len(candidate) == 8:
+            return candidate
+
+    # Priority 2 — slash-separated pair without the "1." marker
+    m = re.search(r"\b(\d{2,4})\s*[\/]\s*(\d{4,6})\b", text)
+    if m:
+        candidate = m.group(1) + m.group(2)
+        if len(candidate) == 8:
+            return candidate
+
+    # Priority 3 — first 8-digit token after field 1. (permis block, not header CIN)
+    m_field1 = re.search(r"\b1\.\s*", text)
+    search_from = m_field1.end() if m_field1 else 0
+    m = re.search(r"(?<!\d)([0-9]{8})(?!\d)", text[search_from:])
+    if m:
+        return m.group(1)
+
+    # Priority 4 — any 8-digit not in the CIN / field-5 context window
+    _cin_context = re.compile(
+        r"\b5\.\s*"  # EU 5. = date of birth; adjacent 8-digit is often CIN on Tunisian cards
+        r"|carte\s+nationale|national\s+id|num[eé]ro.*cin|N°\s*CIN|identit[eé]\s+nationale",
+        re.IGNORECASE,
+    )
+    for m in re.finditer(r"(?<!\d)([0-9]{8})(?!\d)", text):
+        window = text[max(0, m.start() - 80): m.end() + 80]
+        if _cin_context.search(window):
+            continue
+        return m.group(1)
+    return None
 
 
 def _disambiguate_permis_dates(
@@ -571,8 +806,18 @@ def _disambiguate_permis_dates(
             if len(past) >= 2:
                 delivrance = past[-1]
         elif len(remaining) == 2:
-            naissance = remaining[0]
-            expiration = remaining[1]
+            past = [d for d in remaining if _iso_to_date(d) < today]
+            future = [d for d in remaining if _iso_to_date(d) >= today]
+            if past and future:
+                naissance = past[0]
+                delivrance = past[-1] if len(past) > 1 else None
+                expiration = future[0]
+            elif len(past) == 2:
+                naissance = past[0]
+                delivrance = past[1]
+            else:
+                naissance = remaining[0]
+                expiration = remaining[1]
         elif len(remaining) == 1:
             y = _iso_to_date(remaining[0]).year
             if y > today.year:
@@ -599,63 +844,53 @@ def _disambiguate_permis_dates(
 
 def _parse_permis(text: str) -> dict[str, Any]:
     warnings: list[str] = []
+    is_verso = _is_permis_verso(text)
 
-    # ── numéro permis ──
-    # Permis tunisien format: 8 chiffres, l'OCR peut insérer un espace ou slash
-    # ex. "23/ 238943" → on colle les blocs de chiffres autour de "1."
-    numero = None
-    m = re.search(r"\b(\d{8})\b", text)
-    if m:
-        numero = m.group(1)
+    numero: str | None = None
+    nom: str | None = None
+    prenom: str | None = None
+    date_naissance: str | None = None
+    date_delivrance: str | None = None
+    date_expiration: str | None = None
+    categories: list[str] = []
+
+    if is_verso:
+        # Verso: expiration + categories only (numero/names are on the recto).
+        categories = _find_permis_categories(text, is_verso=True)
+        date_expiration = _find_permis_verso_expiration(text)
     else:
-        # Reconstruit depuis "1. 23/ 238943" ou "1. 23 238943"
-        m = re.search(r"(?:^|\s)1\.\s*(\d[\d\s\/]+\d)", text)
+        numero = _find_permis_numero(text)
+
+        m = re.search(r"\b3\.\s+([A-Z]{2,}(?:\s+[A-Z]{2,})*)", text)
         if m:
-            candidate = re.sub(r"[\s\/]", "", m.group(1))
-            if len(candidate) == 8:
-                numero = candidate
-        if not numero:
-            # Dernier recours: deux groupes de chiffres adjacents → 8 digits
-            m = re.search(r"\b(\d{2,4})\s*[\/]\s*(\d{4,6})\b", text)
-            if m:
-                candidate = m.group(1) + m.group(2)
-                if len(candidate) == 8:
-                    numero = candidate
+            nom = m.group(1).split()[0]
 
-    # ── catégories: A B C D E (seules ou suivies d'un chiffre ex. C4) ──
-    categories = sorted(set(re.findall(r"\b([ABCDE])\d?\b", text)))
-
-    # ── nom: premier mot majuscule après "3." (champ EU = Nom de famille) ──
-    nom = None
-    m = re.search(r"\b3\.\s+([A-Z]{2,}(?:\s+[A-Z]{2,})*)", text)
-    if m:
-        # Prendre uniquement la première suite de mots en majuscules
-        nom = m.group(1).split()[0]  # "KARKOUB t.mdiy..." → "KARKOUB"
-
-    # ── prenom: champ 4 EU (OCR lit parfois "4." comme "t." ou "4a.") ──
-    prenom = None
-    _FIELD_LABELS = r"(?:Nom|Pr[eé]nom|Date|Lieu|Num[eé]ro|Nature|Nombre|Adresse|Identit|Cat[eé]g|transform)"
-    # Essai 1 : "4." explicite — exclut "4a."/"4b." qui sont des labels de dates.
-    m = re.search(r"\b4\.\s+([A-Za-z][A-Za-z\s\-\']{2,30})(?=\s+\d+\.|\s{2}|$)", text)
-    if m:
-        candidate = m.group(1).strip()
-        if not re.search(_FIELD_LABELS, candidate, re.IGNORECASE):
-            prenom = candidate
-    # Essai 2 : "t." juste après le nom → OCR misread de "4."
-    if not prenom and nom:
-        m = re.search(rf"{re.escape(nom)}\s+t\.\s*([A-Za-z]{{2,}})", text, re.IGNORECASE)
-        if m:
-            prenom = m.group(1).strip()
-
-    # ── dates: label-anchored extraction → chronological fallback ──
-    date_naissance = _find_labeled_date(text, _PERMIS_NAISSANCE_LABELS)
-    date_delivrance = _find_labeled_date(text, _PERMIS_DELIVRANCE_LABELS)
-    date_expiration = _find_labeled_date(text, _PERMIS_EXPIRATION_LABELS)
-
-    if not (date_naissance and date_delivrance and date_expiration):
-        date_naissance, date_delivrance, date_expiration = _disambiguate_permis_dates(
-            text, date_naissance, date_delivrance, date_expiration, warnings
+        prenom = None
+        _FIELD_LABELS = (
+            r"(?:Nom|Pr[eé]nom|Date|Lieu|Num[eé]ro|Nature|Nombre|Adresse|Identit|"
+            r"Cat[eé]g|transform)"
         )
+        m = re.search(r"\b4\.\s+([A-Za-z][A-Za-z\s\-\']{2,30})(?=\s+\d+\.|\s{2}|$)", text)
+        if m:
+            candidate = m.group(1).strip()
+            if not re.search(_FIELD_LABELS, candidate, re.IGNORECASE):
+                prenom = candidate
+        if not prenom and nom:
+            m = re.search(rf"{re.escape(nom)}\s+t\.\s*([A-Za-z]{{2,}})", text, re.IGNORECASE)
+            if m:
+                prenom = m.group(1).strip()
+
+        # Global expiry is on the verso; recto may only expose field 8 (e.g. "8. B").
+        categories = _find_permis_categories(text, is_verso=False)
+
+        date_naissance = _find_labeled_date(text, _PERMIS_NAISSANCE_LABELS)
+        date_delivrance = _find_labeled_date(text, _PERMIS_DELIVRANCE_LABELS)
+        date_expiration = None
+
+        if not (date_naissance and date_delivrance):
+            date_naissance, date_delivrance, _ = _disambiguate_permis_dates(
+                text, date_naissance, date_delivrance, None, warnings
+            )
 
     today = date.today()
     if date_expiration and _iso_to_date(date_expiration) < today:
@@ -678,16 +913,24 @@ def _parse_permis(text: str) -> dict[str, Any]:
 
 
 def _parse_cin(text: str) -> dict[str, Any]:
+    logger.info("[parser:cin] raw_text=%r", text)
+
     numero = _find_cin_number(text)
 
     # ── Names: AR labels → AR fallback → Latin (legacy) ─────────────────
     nom = _extract_arabic_name(text, _LABEL_NOM_AR)
     prenom = _extract_arabic_name(text, _LABEL_PRENOM_AR)
 
-    # Verso scans contain parent/address info, not the cardholder's name.
-    # If the "mother" label is present, the word-order fallback would
-    # promote OCR noise — skip it.
-    is_verso = bool(re.search(r"الأم|الام|الأب", text))
+    # The recto prints "الجمهورية التونسية بطاقة التعريف الوطنية" (the
+    # national-ID header). The verso has no header but does have address
+    # fields and parent labels (الأم / الأب). Some Tunisian CIN formats
+    # include the mother's name in the recto lineage ("… الام سهيلة …"),
+    # so presence of "الأم" alone is not a reliable verso indicator —
+    # we require BOTH the parent label AND the absence of the recto header.
+    has_parent_label = bool(re.search(r"الأم|الام|الأب|الاب", text))
+    has_recto_header = any(p.search(text) for p in _AR_HEADER_PATTERNS)
+    is_verso = has_parent_label and not has_recto_header
+    logger.info("[parser:cin] is_verso=%s (parent_label=%s, recto_header=%s)", is_verso, has_parent_label, has_recto_header)
 
     if not (nom and prenom) and not is_verso:
         gov_words = set(_GOVERNORATES_AR_TO_FR)
@@ -734,8 +977,17 @@ def _parse_cin(text: str) -> dict[str, Any]:
     nom, prenom, pere = _resolve_pere_and_fix_prenom(text, nom, prenom)
 
     # ── Date: Arabic strict → Arabic loose → Western numeric ────────────
-    # Skip on verso scans (the only date there is the card-issue date).
     date_naissance: str | None = None
+    date_delivrance: str | None = None
+
+    # Label-anchored delivrance extraction works on both recto and verso.
+    date_delivrance = _find_labeled_date(text, _CIN_DELIVRANCE_LABELS)
+    if not date_delivrance:
+        # OCR often emits only "<month> <year>" near the issue-date label.
+        date_delivrance = _find_arabic_month_year_date(text, prefer_most_recent=True)
+    logger.info("[parser:cin] label_anchored date_delivrance=%s", date_delivrance)
+    logger.info("[parser:cin] all_dates=%s", _collect_all_iso_dates(text))
+
     if not is_verso:
         date_naissance = _find_date_arabic(text)
         if not date_naissance:
@@ -749,6 +1001,25 @@ def _parse_cin(text: str) -> dict[str, Any]:
                 # contract "all CIN dates are ISO YYYY-MM-DD or None".
                 date_naissance = _to_iso_date(day, month, year)
 
+        # Recto fallback: any date (Western or Arabic-Indic) not already
+        # claimed as naissance is likely the issue date.
+        if not date_delivrance:
+            for iso in _collect_all_iso_dates(text):
+                if iso != date_naissance:
+                    date_delivrance = iso
+                    break
+    else:
+        # Verso: issue date only (DOB / names live on recto). Never set date_naissance here.
+        if not date_delivrance:
+            all_verso_dates = _collect_all_iso_dates(text)
+            logger.info("[parser:cin] verso all_verso_dates=%s", all_verso_dates)
+            if all_verso_dates:
+                # Issue date is the most recent date on the verso.
+                date_delivrance = max(all_verso_dates, key=_iso_to_date)
+            else:
+                date_delivrance = _find_date_arabic_loose(text)
+                logger.info("[parser:cin] verso loose fallback date_delivrance=%s", date_delivrance)
+
     # ── Governorate: AR map → Latin set ─────────────────────────────────
     gouvernorat = _match_arabic_governorate(text)
     if not gouvernorat:
@@ -761,6 +1032,7 @@ def _parse_cin(text: str) -> dict[str, Any]:
         "pere": pere,
         "numero_cin": numero,
         "date_naissance": date_naissance,
+        "date_delivrance": date_delivrance,
         "gouvernorat": gouvernorat,
         "language_detected": _detect_language(text),
     }
