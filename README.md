@@ -187,6 +187,99 @@ curl -X POST http://localhost:8000/v1/ocr/extract \
   -F "doc_type=permis"
 ```
 
+## Mobile app integration
+
+> **The mobile app never calls this service directly.** This service has no
+> CORS, no public TLS, and trusts a shared `X-Internal-Secret` — exposing it to
+> phones would leak that secret and the internal network. The mobile app talks
+> to the **Node backend** (`dada-api`), which is the only thing that holds the
+> secret and forwards images here.
+
+### Topology
+
+```
+┌─────────────┐   multipart upload    ┌──────────────┐   X-Internal-Secret    ┌──────────────┐
+│  Mobile app │ ────────────────────► │  Node backend │ ─────────────────────► │  ocr-service │
+│  (Kotlin)   │ ◄──────────────────── │   (dada-api)  │ ◄───────────────────── │  (this repo) │
+└─────────────┘    poll for result    └──────────────┘    JSON extraction      └──────────────┘
+     public, no secret                   holds the secret                    internal network only
+```
+
+The backend exposes an **async upload + poll** API to the phone (so the device
+isn't blocked for the 3–4 s OCR takes), and translates each request into a
+single synchronous call to `POST /v1/ocr/extract` on this service.
+
+### 1. Backend → ocr-service (the only caller)
+
+The backend forwards the user's image untouched and injects the secret:
+
+```ts
+// dada-api — forwarding to the OCR service
+const form = new FormData();
+form.append("file", imageBuffer, { filename, contentType });
+form.append("doc_type", docType); // "permis" | "cin" | "carte_grise" | "assurance"
+
+const res = await fetch(`${OCR_SERVICE_URL}/v1/ocr/extract`, {
+  method: "POST",
+  headers: { "X-Internal-Secret": process.env.INTERNAL_SECRET },
+  body: form,
+});
+const { data } = await res.json(); // { doc_type, confidence, status, data, processing_time_ms }
+```
+
+Always branch on `data.status` (`ok` / `review` / `failed`), **not** on the HTTP
+code — a `failed` extraction is still HTTP 200 (see [Endpoints](#post-v1ocrextract)).
+
+### 2. Mobile → backend (Retrofit)
+
+The phone uploads the image to the backend, gets a document id back, then polls
+until the OCR finishes:
+
+```kotlin
+interface OcrApi {
+    // Upload — returns immediately with status "queued"
+    @Multipart
+    @POST("upload/document/ocr")
+    suspend fun upload(
+        @Part file: MultipartBody.Part,
+        @Part("docType") docType: RequestBody,
+    ): OcrUploadResponseDto
+
+    // Poll — status becomes "ok" | "review" | "failed" once OCR resolves
+    @GET("upload/document/ocr/{id}")
+    suspend fun poll(@Path("id") id: String): OcrPollResponseDto
+}
+```
+
+Polling loop (simplified):
+
+```kotlin
+val uploaded = ocrApi.upload(filePart, docType.toRequestBody())
+var result = ocrApi.poll(uploaded.document.id)
+while (result.status == null) {            // null == still processing
+    delay(1_000)
+    result = ocrApi.poll(uploaded.document.id)
+}
+
+when (result.status) {
+    "ok"     -> prefillForm(result.fields)            // trust the fields
+    "review" -> prefillForm(result.fields, editable = true) // ask the user to confirm
+    "failed" -> promptRetake()                         // confidence too low → re-shoot
+}
+```
+
+The DTOs (`OcrUploadResponseDto`, `OcrPollResponseDto`, `OcrFieldsDto`) live in
+the mobile repo under `data/network/dto/OcrDtos.kt`. Field names mirror this
+service's response (`nom`, `prenom`, `numero_cin`, `date_naissance`,
+`date_delivrance`, `categories`, …).
+
+### Capture tips for good OCR
+
+- Shoot in **landscape**, fill the frame with the document, avoid glare.
+- Send the original JPEG; don't downscale below ~1000 px on the long edge.
+- Keep `OCR_USE_ORIENTATION_DETECTION=true` (default) so sideways phone photos
+  are still read correctly.
+
 ## Project structure
 
 ```
